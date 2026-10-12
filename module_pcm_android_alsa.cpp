@@ -1,6 +1,7 @@
 #include <cstdlib>
 #include <memory>
 #include <vector>
+#include <atomic>
 
 #include <alsa/asoundlib.h>
 #include <alsa/pcm_external.h>
@@ -39,7 +40,7 @@ static oboe::AudioFormat toOboeFormat(snd_pcm_format_t alsaFormat) {
 
 	return format;
 }
-
+/*
 static int oboe_to_alsa_error(oboe::Result result) {
 	switch (result) {
 		case oboe::Result::ErrorDisconnected:
@@ -52,8 +53,8 @@ static int oboe_to_alsa_error(oboe::Result result) {
 			return -1;
 	}
 }
-
-class AndroidALSA {
+*/
+class AndroidALSA : oboe::AudioStreamDataCallback, oboe::AudioStreamErrorCallback {
 	private:
 		std::shared_ptr<oboe::AudioStream> mStream;
 		std::mutex mtx;
@@ -61,10 +62,57 @@ class AndroidALSA {
 			.version = SND_PCM_IOPLUG_VERSION,
 			.name = "ALSA <-> Android PCM Plugin",
 			.callback = &android_alsa_callback,
-			.mmap_rw = 0,
+			.mmap_rw = 1,
 			.private_data = this
 		};
+		std::atomic<uint64_t> pointer{0};
+		std::atomic<uint64_t> lastPointerUpdateNs{0};
+		std::atomic_bool disconnected{false};
+		std::atomic_bool frozen{false};
 
+		oboe::DataCallbackResult onAudioReady(oboe::AudioStream *oboeStream, void *audioData, int32_t numFrames) {
+			int bytesPerFrame = io.channels * snd_pcm_format_physical_width(io.format) / 8;
+			const snd_pcm_channel_area_t *areas = snd_pcm_ioplug_mmap_areas(&io);
+
+			uint64_t offset = pointer.load(std::memory_order_relaxed) % io.buffer_size;
+			uint64_t start = std::min<uint64_t>(numFrames, io.buffer_size - offset);
+
+			uint8_t *data = static_cast<uint8_t *>(areas->addr) + ((areas->first) / 8);
+			
+			if (io.format == SND_PCM_FORMAT_U8) {
+				int16_t *dst = static_cast<int16_t *>(audioData);
+				for (int32_t i = 0; i < numFrames; i++) {
+					uint64_t position = (offset + i) % io.buffer_size;
+					for (unsigned c = 0; c < io.channels; c++) {
+						*dst++ = static_cast<int16_t>((data[position * io.channels + c] - 128) * 256);
+					}
+				}
+			}
+			else {
+				memcpy(audioData, data + offset * bytesPerFrame, start * bytesPerFrame);
+				if (numFrames > start)
+					memcpy(static_cast<uint8_t *>(audioData) + start * bytesPerFrame, data, (numFrames - start) * bytesPerFrame);
+			}
+			
+			pointer.store(pointer + numFrames, std::memory_order_release);
+
+			auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+			lastPointerUpdateNs.store(now, std::memory_order_relaxed);
+			
+			return oboe::DataCallbackResult::Continue;
+		}
+
+		void onErrorBeforeClose(oboe::AudioStream *stream, oboe::Result result) {
+			printf("Detected error %d, processing stream before closing", result);
+		}
+
+		void onErrorAfterClose(oboe::AudioStream *stream, oboe::Result result) {
+			printf("Detected error %d, processing stream after closing", result);
+			
+			if (result == oboe::Result::ErrorDisconnected)
+				disconnected = true;			
+		}
+/*
 		uint8_t *convertU8ToI16(snd_pcm_ioplug_t* io, uint8_t *data, snd_pcm_uframes_t size) {
 			auto numSamples = io->channels * size;
 			uint8_t *output = reinterpret_cast<uint8_t *>(malloc(numSamples * sizeof(int16_t)));
@@ -77,7 +125,7 @@ class AndroidALSA {
 
 			return output;
 		}
-
+*/
 		int android_alsa_set_hw_constraint(snd_pcm_ioplug_t* io) 
 		{
 		    static const std::vector<unsigned int> access_list = { SND_PCM_ACCESS_RW_INTERLEAVED };
@@ -115,6 +163,17 @@ class AndroidALSA {
 			auto self = static_cast<AndroidALSA *>(io->private_data);
 		
 			std::scoped_lock lock(self->mtx);
+
+			if (self->disconnected)
+				self->mStream.reset();
+
+			if (self->frozen) {
+				self->mStream->requestStop();
+				self->mStream.reset();
+			}
+
+			if (self->mStream)
+				return 0;
 			
 			oboe::AudioStreamBuilder mStreamBuilder;
 			mStreamBuilder.setSampleRate(io->rate);
@@ -122,27 +181,47 @@ class AndroidALSA {
 			mStreamBuilder.setFormat(toOboeFormat(io->format));
 			mStreamBuilder.setAudioApi(oboe::AudioApi::AAudio);
 			mStreamBuilder.setSharingMode(oboe::SharingMode::Shared);
+			mStreamBuilder.setDataCallback(self);
+			mStreamBuilder.setErrorCallback(self);
+			mStreamBuilder.setFramesPerDataCallback(io->period_size);
 			mStreamBuilder.setPerformanceMode(oboe::PerformanceMode::LowLatency);
+			mStreamBuilder.setUsage(oboe::Usage::Game);
 			mStreamBuilder.setChannelConversionAllowed(true);
 			mStreamBuilder.setFormatConversionAllowed(true);
+			mStreamBuilder.setSampleRateConversionQuality(oboe::SampleRateConversionQuality::High);
+			mStreamBuilder.setBufferCapacityInFrames(io->buffer_size);
 			
 			oboe::Result result = mStreamBuilder.openStream(self->mStream);
 			if (result != oboe::Result::OK) {
 				printf("Failed to prepare stream, result %d", result);
 				return -1;
 			}
-
-			self->mStream->setBufferSizeInFrames(io->buffer_size);
-
-			if (self->mStream->getBufferSizeInFrames() != io->buffer_size) {
-				printf("Buffer size mismatch, recovering stream");
+			
+			if (self->mStream->getBufferCapacityInFrames() < io->buffer_size) {
+				printf("Buffer capacity %d is lower than ALSA buffer size %d, invalid stream",
+					self->mStream->getBufferCapacityInFrames(), io->buffer_size);
+					
+				self->mStream->requestStop();
 				self->mStream.reset();
-				return -1;
+				return -EAGAIN;
 			}
+			
+			self->mStream->setBufferSizeInFrames(io->buffer_size);
+			
+			printf("Created stream capacity %lu, size %lu, burst %d from ALSA size %d, period_size %d",
+				self->mStream->getBufferCapacityInFrames(), self->mStream->getBufferSizeInFrames(),
+			    self->mStream->getFramesPerBurst(), io->buffer_size, io->period_size);
+
+			self->pointer.store(0);
+			self->disconnected = false;
+			self->frozen = false;
+
+			auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+			self->lastPointerUpdateNs.store(now);
 			
 			return 0;
 		}
-
+		/*
 		static snd_pcm_sframes_t android_alsa_transfer(snd_pcm_ioplug_t* io, const snd_pcm_channel_area_t* areas, snd_pcm_uframes_t offset, snd_pcm_uframes_t size) 
 		{
 			auto self = static_cast<AndroidALSA *>(io->private_data);
@@ -174,10 +253,10 @@ class AndroidALSA {
 				}
 			}
 
-			/*
+			
 			printf("size=%lu buffer_size=%lu offset=%lu",
 			       (unsigned long)size, (unsigned long)io->buffer_size, (unsigned long)offset);
-			*/
+			
 			uint8_t *data = static_cast<uint8_t *>(areas[0].addr) + (areas->first + areas->step * offset) / 8;
 			if (!data)
 				return 0;
@@ -185,16 +264,17 @@ class AndroidALSA {
 			if (io->format == SND_PCM_FORMAT_U8)
 				data = self->convertU8ToI16(io, data, size);
 			
-			auto framesWritten = self->mStream->write(data, size, self->io.nonblock ? 0 : INT64_MAX);
+			auto framesWritten = self->mStream->write(data, size, io->nonblock ? 0 : INT64_MAX);
 			if (framesWritten.error() != oboe::Result::OK) {
 				printf("Failed to write audio frames, result %d", framesWritten.error());
 				return oboe_to_alsa_error(framesWritten.error());
 			}
-			/*
+			
 			printf("write result=%d state=%d value=%d", framesWritten.error(), (int)self->mStream->getState(), framesWritten.value());
-			*/
+			
 			return framesWritten.value() < size ? framesWritten.value() : size;
 		}
+		*/
 
 		static int android_alsa_drain(snd_pcm_ioplug_t* io) 
 		{
@@ -299,12 +379,30 @@ class AndroidALSA {
 			
 			if (!self->mStream)
 				return -EBADFD;
-
-			std::scoped_lock lock(self->mtx);
-		
-			//printf("read=%lld written=%lld state=%d", (long long)self->mStream->getFramesRead(), (long long)self->mStream->getFramesWritten(), (int)self->mStream->getState());
+/*
+			auto count = self->mStream->getXRunCount();
+			if (count.error() != oboe::Result::OK || count.value() > 0) {
+				printf("XRun detected, recovering ALSA stream");
+				self->mStream.reset();
+				return -EPIPE;
+			}
 			
-			return (snd_pcm_sframes_t)(self->mStream->getFramesRead() % self->io.buffer_size);
+			printf("pointer %lld", (long long)self->mStream->getFramesWritten() % self->io.buffer_size);
+*/
+
+			if (self->disconnected) {                                                                   
+				printf("Stream disconnected, recreating ALSA stream");                                    
+				return -EPIPE;                                                                      
+			}
+
+			auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+			if (io->state == SND_PCM_STATE_RUNNING && now - self->lastPointerUpdateNs.load(std::memory_order_relaxed) > 300'000'000LL) {
+				printf("Data callback hasn't fired for more than 300ms");
+				self->frozen = true;
+				return -EPIPE;
+			}
+			
+			return (snd_pcm_sframes_t)(self->pointer.load(std::memory_order_acquire) % self->io.buffer_size);
 		}
 
 		constexpr static snd_pcm_ioplug_callback_t android_alsa_callback = {
@@ -314,7 +412,7 @@ class AndroidALSA {
 		    .pause = android_alsa_pause,
 		    .resume = android_alsa_start,
 		    .prepare = android_alsa_prepare,
-		    .transfer = android_alsa_transfer,
+		    //.transfer = android_alsa_transfer,
 		    .drain = android_alsa_drain,
 		    .pointer = android_alsa_pointer,
 		};
